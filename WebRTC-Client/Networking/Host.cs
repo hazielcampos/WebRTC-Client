@@ -1,12 +1,10 @@
 ﻿using SIPSorcery.Net;
 using System;
-using System.Collections.Generic;
-using System.Linq;
 using System.Text;
 using System.Threading.Tasks;
-using Newtonsoft.Json.Linq;
 using Newtonsoft.Json;
-using SIPSorcery.SIP.App;
+using Newtonsoft.Json.Linq;
+using System.Collections.Concurrent;
 
 namespace WebRTC_Client.Networking
 {
@@ -17,57 +15,71 @@ namespace WebRTC_Client.Networking
         public event Func<string, string, Task> OnWebRTCAnswerReceived;
         public event Func<string, string, Task> OnWebRTCIceCandidateReceived;
         public event Action<string, string> OnMessageReceived;
-        public Dictionary<string, PeerSession> peers = new Dictionary<string, PeerSession>();
+
+        public ConcurrentDictionary<string, PeerSession> peers =
+            new ConcurrentDictionary<string, PeerSession>();
+
         private string _roomId;
-        public Host()
-        {
-        }
+
         public async Task StartAsync()
         {
             await ConnectAsync();
 
-            OnRoomCreated += (roomId) =>
+            OnRoomCreated += roomId =>
             {
                 _roomId = roomId;
                 Console.WriteLine($"Room created with ID: {roomId}");
             };
+
             OnPeerJoined += HandlePeerJoined;
             OnWebRTCAnswerReceived += HandleRTCAnswerReceived;
             OnWebRTCIceCandidateReceived += HandleRTCIceCandidateReceived;
         }
-        public async Task HandlePeerJoined(string peerId)
+
+        private async Task HandlePeerJoined(string peerId)
         {
             var pc = new RTCPeerConnection(rtcConfig);
+
             var peer = new PeerSession
             {
                 PeerId = peerId,
                 PC = pc
             };
 
-            pc.onicecandidate += (ice) =>
+            peers.TryAdd(peerId, peer);
+
+            pc.onicecandidate += async ice =>
             {
-                if(ice != null)
+                if (ice == null)
+                    return;
+
+                if (!IsSignalingConnected)
                 {
-                    SendSignalingAsync(JsonConvert.SerializeObject(new
-                    {
-                        type = "webrtc_ice_candidate",
-                        peer_id = peerId,
-                        candidate = ice.candidate
-                    }));
+                    peer.PendingIceToSend.Add(ice.candidate);
+                    return;
                 }
+
+                await SendSignalingAsync(JsonConvert.SerializeObject(new
+                {
+                    type = "webrtc_ice_candidate",
+                    peer_id = peerId,
+                    candidate = ice.candidate
+                }));
             };
 
             peer.DataChannel = await pc.createDataChannel("data");
+
             peer.DataChannel.onopen += () =>
                 Console.WriteLine($"Data channel with peer {peerId} is open.");
 
             peer.DataChannel.onmessage += (dc, protocol, data) =>
             {
-                string message = data != null ? Encoding.UTF8.GetString(data) : string.Empty;
+                var message = data != null
+                    ? Encoding.UTF8.GetString(data)
+                    : string.Empty;
+
                 OnMessageReceived?.Invoke(peerId, message);
             };
-
-            peers[peerId] = peer;
 
             var offer = pc.createOffer(null);
             await pc.setLocalDescription(offer);
@@ -79,108 +91,142 @@ namespace WebRTC_Client.Networking
                 sdp = offer.sdp
             }));
         }
-        public async Task HandleRTCAnswerReceived(string peerId, string sdp)
+
+        private async Task HandleRTCAnswerReceived(string peerId, string sdp)
         {
-            var pc = peers[peerId].PC;
-            var description = new RTCSessionDescriptionInit
+            if (!peers.TryGetValue(peerId, out var peer))
+                return;
+
+            var pc = peer.PC;
+
+            pc.setRemoteDescription(new RTCSessionDescriptionInit
             {
                 type = RTCSdpType.answer,
                 sdp = sdp
-            };
-            pc.setRemoteDescription(description);
+            });
 
-            foreach (var ice in peers[peerId].PendingIce)
+            foreach (var ice in peer.PendingIce)
                 pc.addIceCandidate(ice);
 
-            peers[peerId].PendingIce.Clear();
+            peer.PendingIce.Clear();
+
+            foreach (var candidate in peer.PendingIceToSend)
+            {
+                await SendSignalingAsync(JsonConvert.SerializeObject(new
+                {
+                    type = "webrtc_ice_candidate",
+                    peer_id = peerId,
+                    candidate = candidate
+                }));
+            }
+
+            peer.PendingIceToSend.Clear();
+
+            return;
         }
-        public Task HandleRTCIceCandidateReceived(string peerId, string candidate)
+
+        private Task HandleRTCIceCandidateReceived(string peerId, string candidate)
         {
-            var pc = peers[peerId].PC;
+            if (!peers.TryGetValue(peerId, out var peer))
+                return Task.CompletedTask;
+
+            var pc = peer.PC;
+
             var ice = new RTCIceCandidateInit
             {
                 candidate = candidate,
                 sdpMid = "data",
                 sdpMLineIndex = 0
             };
+
             if (pc.RemoteDescription == null)
-            {
-                peers[peerId].PendingIce.Add(ice);
-            }
+                peer.PendingIce.Add(ice);
             else
-            {
                 pc.addIceCandidate(ice);
-            }
-            return Task.CompletedTask;
-        }
-        public Task SendMessageToPeer(string peerId, string message)
-        {
-            if (peers.ContainsKey(peerId))
-            {
-                var dataChannel = peers[peerId].DataChannel;
-                if (dataChannel.readyState == RTCDataChannelState.open)
-                {
-                    byte[] data = Encoding.UTF8.GetBytes(message);
-                    dataChannel.send(data);
-                }
-            }
-            return Task.CompletedTask;
-        }
-        public Task SendMessageToAllPeers(string message)
-        {
-            foreach (var peerId in peers.Keys)
-            {
-                SendMessageToPeer(peerId, message);
-            }
+
             return Task.CompletedTask;
         }
 
-        public async Task CreateRoom()
+        public Task SendMessageToPeer(string peerId, string message)
         {
-            await SendSignalingAsync(JsonConvert.SerializeObject(new
+            if (!peers.TryGetValue(peerId, out var peer))
+                return Task.CompletedTask;
+
+            if (peer.DataChannel?.readyState == RTCDataChannelState.open)
+            {
+                peer.DataChannel.send(Encoding.UTF8.GetBytes(message));
+            }
+
+            return Task.CompletedTask;
+        }
+
+        public Task SendMessageToAllPeers(string message)
+        {
+            foreach (var peerId in peers.Keys)
+                _ = SendMessageToPeer(peerId, message);
+
+            return Task.CompletedTask;
+        }
+
+        public Task CreateRoom()
+        {
+            return SendSignalingAsync(JsonConvert.SerializeObject(new
             {
                 type = "create_room"
             }));
         }
-        
+
         public override void HandleSignalingMessage(string msg)
         {
             JObject json = JObject.Parse(msg);
-
             string type = json["type"]?.ToString();
-            switch(type)
+
+            switch (type)
             {
                 case "room_created":
                     OnRoomCreated?.Invoke(json["room_id"]?.ToString());
                     break;
+
                 case "peer_joined":
-                    _ = RaisePeerJoined(json["peer_id"]?.ToString());
+                    RaisePeerJoined(json["peer_id"]?.ToString());
                     break;
+
                 case "webrtc_answer":
-                    _ = RaiseWebRTCAnswerReceived(json["peer_id"]?.ToString(), json["sdp"]?.ToString());
+                    RaiseWebRTCAnswerReceived(
+                        json["peer_id"]?.ToString(),
+                        json["sdp"]?.ToString());
                     break;
+
                 case "webrtc_ice_candidate":
-                    _ = RaiseWebRTCIceCandidateReceived(json["peer_id"]?.ToString(), json["candidate"]?.ToString());
+                    RaiseWebRTCIceCandidateReceived(
+                        json["peer_id"]?.ToString(),
+                        json["candidate"]?.ToString());
                     break;
             }
         }
-        private async Task RaisePeerJoined(string peerId)
+
+        private void RaisePeerJoined(string peerId)
         {
-            if (OnPeerJoined != null)
-                foreach (Func<string, Task> handler in OnPeerJoined.GetInvocationList())
-                    await handler(peerId);
+            if (OnPeerJoined == null) return;
+
+            foreach (Func<string, Task> handler in OnPeerJoined.GetInvocationList())
+                _ = handler(peerId);
         }
-        private async Task RaiseWebRTCAnswerReceived(string peerId, string sdp)
+
+        private void RaiseWebRTCAnswerReceived(string peerId, string sdp)
         {
-            if (OnWebRTCAnswerReceived != null)
-                foreach (Func<string, string, Task> handler in OnWebRTCAnswerReceived.GetInvocationList())
-                    await handler(peerId, sdp);
+            if (OnWebRTCAnswerReceived == null) return;
+
+            foreach (Func<string, string, Task> handler in OnWebRTCAnswerReceived.GetInvocationList())
+                _ = handler(peerId, sdp);
         }
-        private async Task RaiseWebRTCIceCandidateReceived(string peerId, string candidate)
+
+        private void RaiseWebRTCIceCandidateReceived(string peerId, string candidate)
         {
-            if (OnWebRTCIceCandidateReceived != null)
-                foreach (Func<string, string, Task> handler in OnWebRTCIceCandidateReceived.GetInvocationList())
-                    await handler(peerId, candidate);
+            if (OnWebRTCIceCandidateReceived == null) return;
+
+            foreach (Func<string, string, Task> handler in OnWebRTCIceCandidateReceived.GetInvocationList())
+                _ = handler(peerId, candidate);
         }
     }
 }

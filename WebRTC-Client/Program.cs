@@ -1,4 +1,6 @@
-﻿using System;
+﻿using SIPSorcery.Net;
+using System;
+using System.Text;
 using System.Threading.Tasks;
 using WebRTC_Client.Networking;
 
@@ -26,53 +28,61 @@ namespace WebRTC_Client
                     continue;
 
                 var split = input.Split(new[] { ' ' }, 2);
-                var cmd = split[0].ToLower();
+                var cmd = split[0].ToLowerInvariant();
 
-                switch (cmd)
+                try
                 {
-                    case "host":
-                        await StartHost();
-                        break;
-
-                    case "client":
-                        if (split.Length < 2)
-                        {
-                            Console.WriteLine("Usage: client <room_id>");
+                    switch (cmd)
+                    {
+                        case "host":
+                            await StartHost();
                             break;
-                        }
-                        await StartClient(split[1]);
-                        break;
 
-                    case "msg":
-                        if (split.Length < 2)
-                        {
-                            Console.WriteLine("Usage: msg <text>");
+                        case "client":
+                            if (split.Length < 2)
+                            {
+                                Console.WriteLine("Usage: client <room_id>");
+                                break;
+                            }
+                            await StartClient(split[1]);
                             break;
-                        }
-                        await SendMessage(split[1]);
-                        break;
 
-                    case "exit":
-                        return;
+                        case "msg":
+                            if (split.Length < 2)
+                            {
+                                Console.WriteLine("Usage: msg <text>");
+                                break;
+                            }
+                            await SendMessage(split[1]);
+                            break;
 
-                    default:
-                        Console.WriteLine("Unknown command");
-                        break;
+                        case "exit":
+                            await Shutdown();
+                            return;
+
+                        default:
+                            Console.WriteLine("Unknown command");
+                            break;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"[FATAL] {ex.Message}");
                 }
             }
         }
 
-        static Task StartHost()
+        static async Task StartHost()
         {
-            if (host != null)
+            if (host != null || client != null)
             {
-                Console.WriteLine("Host already running.");
-                return Task.CompletedTask;
+                Console.WriteLine("Host or Client already running.");
+                return;
             }
 
             host = new Host();
 
-            host.OnRoomCreated += (roomId) =>
+            host.OnRoomCreated += roomId =>
             {
                 Console.WriteLine($"[HOST] Room created: {roomId}");
             };
@@ -82,37 +92,32 @@ namespace WebRTC_Client
                 Console.WriteLine($"[FROM {peerId}] {message}");
             };
 
-            // 🔥 NO BLOQUEAR LA CONSOLA
-            Task.Run(async () =>
-            {
-                await host.StartAsync();
-                await host.CreateRoom();
-            });
-
-            return Task.CompletedTask;
+            Console.WriteLine("[HOST] Connecting...");
+            await host.StartAsync();
+            await host.CreateRoom();
         }
-
 
         static async Task StartClient(string roomId)
         {
-            if (client != null)
+            if (client != null || host != null)
             {
-                Console.WriteLine("Client already running.");
+                Console.WriteLine("Host or Client already running.");
                 return;
             }
 
             client = new Client(roomId);
 
-            client.onMessageReceived += (msg) =>
+            client.OnMessageReceived += msg =>
             {
                 Console.WriteLine($"[HOST] {msg}");
             };
 
-            client.onError += (err) =>
+            client.OnError += err =>
             {
                 Console.WriteLine($"[ERROR] {err}");
             };
 
+            Console.WriteLine("[CLIENT] Connecting...");
             await client.StartAsync();
 
             Console.WriteLine($"[CLIENT] Joining room {roomId}");
@@ -122,21 +127,45 @@ namespace WebRTC_Client
         {
             if (host != null)
             {
+                if (host.peers.Count == 0)
+                {
+                    Console.WriteLine("[HOST] No peers connected.");
+                    return;
+                }
+
                 await host.SendMessageToAllPeers(message);
                 Console.WriteLine("[HOST -> ALL] " + message);
                 return;
             }
 
-            if (client != null)
+            if (client?.session?.DataChannel != null &&
+                client.session.DataChannel.readyState == RTCDataChannelState.open)
             {
-                // Solo hay un DataChannel
-                client.session?.DataChannel?.send(
-                    System.Text.Encoding.UTF8.GetBytes(message)
+                client.session.DataChannel.send(
+                    Encoding.UTF8.GetBytes(message)
                 );
+                Console.WriteLine("[CLIENT -> HOST] " + message);
                 return;
             }
 
-            Console.WriteLine("No host or client running.");
+            Console.WriteLine("No active connection or DataChannel not open.");
+        }
+
+        static async Task Shutdown()
+        {
+            Console.WriteLine("Shutting down...");
+
+            if (host != null)
+            {
+                await host.DisconnectAsync();
+                host = null;
+            }
+
+            if (client != null)
+            {
+                await client.DisconnectAsync();
+                client = null;
+            }
         }
     }
 }

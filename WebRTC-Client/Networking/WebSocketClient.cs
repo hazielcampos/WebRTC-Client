@@ -1,6 +1,4 @@
 ﻿using System;
-using System.Collections.Generic;
-using System.Linq;
 using System.Net.WebSockets;
 using System.Text;
 using System.Threading;
@@ -11,72 +9,152 @@ namespace WebRTC_Client.Networking
     public class WebSocketClient
     {
         private ClientWebSocket _ws;
-        private CancellationTokenSource _cts;
+        private CancellationTokenSource _receiveCts;
+        private readonly object _lock = new object();
+        private bool _disconnectedRaised;
+        private readonly SemaphoreSlim _sendLock = new SemaphoreSlim(1, 1);
 
         public event Action OnConnected;
         public event Action OnDisconnected;
         public event Action<string> OnMessage;
         public event Action<Exception> OnError;
 
-        public bool IsConnected => _ws?.State == WebSocketState.Open;
+        public bool IsConnected =>
+            _ws != null && _ws.State == WebSocketState.Open;
 
         public async Task ConnectAsync(string url)
         {
-            _ws = new ClientWebSocket();
-            _cts = new CancellationTokenSource();
-            await _ws.ConnectAsync(new Uri(url), _cts.Token);
+            lock (_lock)
+            {
+                _ws = new ClientWebSocket();
+                _receiveCts = new CancellationTokenSource();
+                _disconnectedRaised = false;
+            }
+
+            await _ws.ConnectAsync(new Uri(url), CancellationToken.None);
             OnConnected?.Invoke();
 
-            _ = Task.Run(ReceiveLoop);
+            _ = Task.Run(ReceiveLoopAsync);
         }
+
         public async Task SendAsync(string message)
         {
-            if (_ws.State != WebSocketState.Open)
+            if (!IsConnected)
                 return;
 
-            var data = Encoding.UTF8.GetBytes(message);
-            await _ws.SendAsync(new ArraySegment<byte>(data), WebSocketMessageType.Text, true, _cts.Token);
-        }
-
-        private async Task ReceiveLoop()
-        {
-            var buffer = new byte[1024 * 4];
+            await _sendLock.WaitAsync();
             try
             {
-                while (_ws.State == WebSocketState.Open)
+                byte[] data = Encoding.UTF8.GetBytes(message);
+
+                await _ws.SendAsync(
+                    new ArraySegment<byte>(data),
+                    WebSocketMessageType.Text,
+                    true,
+                    CancellationToken.None
+                );
+            }
+            catch (Exception ex)
+            {
+                OnError?.Invoke(ex);
+                TriggerDisconnected();
+            }
+            finally
+            {
+                _sendLock.Release();
+            }
+        }
+
+
+        private async Task ReceiveLoopAsync()
+        {
+            var buffer = new byte[4096];
+
+            try
+            {
+                while (IsConnected && !_receiveCts.IsCancellationRequested)
                 {
                     var sb = new StringBuilder();
                     WebSocketReceiveResult result;
+
                     do
                     {
-                        result = await _ws.ReceiveAsync(new ArraySegment<byte>(buffer), _cts.Token);
+                        result = await _ws.ReceiveAsync(
+                            new ArraySegment<byte>(buffer),
+                            _receiveCts.Token
+                        );
+
                         if (result.MessageType == WebSocketMessageType.Close)
                         {
-                            await _ws.CloseAsync(WebSocketCloseStatus.NormalClosure, "Closing", CancellationToken.None);
-                            OnDisconnected?.Invoke();
+                            await CloseInternalAsync();
                             return;
                         }
+
                         sb.Append(Encoding.UTF8.GetString(buffer, 0, result.Count));
+
                     } while (!result.EndOfMessage);
 
                     OnMessage?.Invoke(sb.ToString());
                 }
             }
+            catch (OperationCanceledException)
+            {
+                // cierre normal, no error
+            }
             catch (Exception ex)
             {
                 OnError?.Invoke(ex);
-                OnDisconnected?.Invoke();
+            }
+            finally
+            {
+                TriggerDisconnected();
             }
         }
 
-        public async Task DisconnectedAsync()
+        public async Task DisconnectAsync()
         {
-            _cts.Cancel();
-            if(_ws.State == WebSocketState.Open)
+            await CloseInternalAsync();
+            TriggerDisconnected();
+        }
+
+        private async Task CloseInternalAsync()
+        {
+            lock (_lock)
             {
-                await _ws.CloseAsync(WebSocketCloseStatus.NormalClosure, "Manual close", CancellationToken.None);
-                OnDisconnected?.Invoke();
+                if (_receiveCts?.IsCancellationRequested == false)
+                    _receiveCts.Cancel();
             }
+
+            try
+            {
+                if (_ws != null &&
+                    (_ws.State == WebSocketState.Open ||
+                     _ws.State == WebSocketState.CloseReceived))
+                {
+                    await _ws.CloseAsync(
+                        WebSocketCloseStatus.NormalClosure,
+                        "Closing",
+                        CancellationToken.None
+                    );
+                }
+            }
+            catch
+            {
+                // ignore
+            }
+        }
+
+        private void TriggerDisconnected()
+        {
+            lock (_lock)
+            {
+                if (_disconnectedRaised)
+                    return;
+
+                _disconnectedRaised = true;
+            }
+
+            OnDisconnected?.Invoke();
         }
     }
 }

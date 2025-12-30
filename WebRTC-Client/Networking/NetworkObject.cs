@@ -10,12 +10,19 @@ namespace WebRTC_Client.Networking
         public string PeerId;
         public RTCPeerConnection PC;
         public RTCDataChannel DataChannel;
+
+        // ICE recibidos antes de tener RemoteDescription
         public List<RTCIceCandidateInit> PendingIce = new List<RTCIceCandidateInit>();
+
+        // ICE generados antes de que signaling esté listo
+        public List<string> PendingIceToSend = new List<string>();
     }
     public abstract class NetworkObject
     {
         public static string SignalingServerURL = "ws://151.240.19.55:8000/ws";
+
         protected WebSocketClient signaling;
+
         protected static RTCConfiguration rtcConfig = new RTCConfiguration
         {
             iceServers = new List<RTCIceServer>
@@ -31,11 +38,14 @@ namespace WebRTC_Client.Networking
                     urls = "turn:151.240.19.55:3478?transport=tcp",
                     username = "webrtc",
                     credential = "worldbuildercoop"
-                },
-
+                }
             }
         };
-        public NetworkObject()
+
+        protected bool IsSignalingConnected =>
+            signaling != null && signaling.IsConnected;
+
+        protected NetworkObject()
         {
             signaling = new WebSocketClient();
 
@@ -44,34 +54,41 @@ namespace WebRTC_Client.Networking
             signaling.OnDisconnected += HandleSignalingDisconnected;
             signaling.OnConnected += HandleSignalingConnected;
         }
-        public async Task ConnectAsync()
+
+        public Task ConnectAsync()
         {
-            await signaling.ConnectAsync(SignalingServerURL);
+            return signaling.ConnectAsync(SignalingServerURL);
         }
-        public virtual void HandleSignalingMessage(string msg)
-        {
-            // Handle incoming signaling messages (SDP, ICE candidates, etc.)
-        }
+
+        public virtual void HandleSignalingMessage(string msg) { }
+
         public virtual void HandleSignalingError(Exception ex)
         {
-            // Handle signaling errors
+            Console.WriteLine("[SIGNALING ERROR] " + ex);
         }
+
         public virtual void HandleSignalingDisconnected()
         {
-
+            Console.WriteLine("[SIGNALING] Disconnected");
         }
+
         public virtual void HandleSignalingConnected()
         {
+            Console.WriteLine("[SIGNALING] Connected");
+        }
 
-        }
-        public virtual async Task DisconnectAsync()
+        public Task DisconnectAsync()
         {
-            await signaling.DisconnectedAsync();
+            return signaling.DisconnectAsync();
         }
-        public Task SendSignalingAsync(string msg)
+
+        protected Task SendSignalingAsync(string msg)
         {
-            if (!signaling.IsConnected)
-                throw new InvalidOperationException("Signaling WebSocket is not connected.");
+            if (!IsSignalingConnected)
+            {
+                Console.WriteLine("[SIGNALING] Dropped message (not connected)");
+                return Task.CompletedTask;
+            }
 
             return signaling.SendAsync(msg);
         }
